@@ -1,11 +1,13 @@
 //! IP-native Embassy stack and fixed-buffer tailnet HTTP service.
 
+use core::cell::RefCell;
 use core::net::Ipv4Addr;
 
 use embassy_futures::select::{Either3, select3};
 use embassy_net::{Config, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embassy_net_driver_channel::driver::{HardwareAddress, LinkState};
 use embassy_net_driver_channel::{Device, Runner, State};
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Duration, Ticker, with_timeout};
@@ -15,8 +17,10 @@ use tailscale_embassy_core::control::ControlMap;
 use tailscale_embassy_core::derp::{DerpClient, DerpError, DerpIncoming};
 use tailscale_embassy_core::disco::{DiscoSession, looks_like_disco};
 use tailscale_embassy_core::packet::{PacketError, parse_ipv4};
-use tailscale_embassy_core::tunnel::{RouterInbound, TailnetRouter};
-use tailscale_embassy_core::{Clock, DiscoPublicKey, NodePublicKey, Rng, TlsTransport};
+use tailscale_embassy_core::tunnel::{RouterError, RouterInbound, TailnetRouter};
+use tailscale_embassy_core::{
+    Clock, DiscoPublicKey, NodePrivateKey, NodePublicKey, Rng, TlsTransport,
+};
 
 /// Tailscale's IPv4 CGNAT route length (`100.64.0.0/10`).
 pub const TAILNET_PREFIX_LEN: u8 = 10;
@@ -235,6 +239,74 @@ impl<const MAX: usize> DerpPeerMap<MAX> {
     }
 }
 
+/// Authenticated routing and DERP-discovery state shared by the control,
+/// tunnel, and relay tasks.
+///
+/// Callers normally place this value behind [`SharedTailnetState`]. A complete
+/// candidate router and DERP projection are validated before either live value
+/// is replaced, so readers never observe a partially applied control update.
+pub struct TailnetControlState<const MAX: usize> {
+    router: TailnetRouter<MAX>,
+    derp_peers: DerpPeerMap<MAX>,
+}
+
+/// A zero-allocation critical-section wrapper for live authenticated state.
+pub type SharedTailnetState<M, const MAX: usize> = Mutex<M, RefCell<TailnetControlState<MAX>>>;
+
+/// Rejection reason for an authenticated live-map update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TailnetStateError {
+    /// The cryptokey router rejected the new routes or policy.
+    Router(RouterError),
+    /// The peer projection exceeded its checked fixed capacity.
+    PeerCapacity,
+    /// Control selected another relay; the existing TLS relay must reconnect.
+    DerpRegionChanged,
+}
+
+impl From<RouterError> for TailnetStateError {
+    fn from(error: RouterError) -> Self {
+        Self::Router(error)
+    }
+}
+
+impl<const MAX: usize> TailnetControlState<MAX> {
+    /// Build the initial shared state from one authenticated control map.
+    pub fn from_control_map(
+        local_key: &NodePrivateKey,
+        map: &ControlMap,
+    ) -> Result<Self, TailnetStateError> {
+        Ok(Self {
+            router: TailnetRouter::from_map(local_key, map)?,
+            derp_peers: DerpPeerMap::from_control_map(map)
+                .ok_or(TailnetStateError::PeerCapacity)?,
+        })
+    }
+
+    /// Atomically replace live peer routes, discovery keys, and packet policy.
+    ///
+    /// A local-address or home-DERP change requires rebuilding infrastructure
+    /// outside this state object and is rejected instead of applying an unsafe
+    /// partial update.
+    pub fn apply_control_map(&mut self, map: &ControlMap) -> Result<(), TailnetStateError> {
+        let derp_peers =
+            DerpPeerMap::from_control_map(map).ok_or(TailnetStateError::PeerCapacity)?;
+        if derp_peers.region_id != self.derp_peers.region_id {
+            return Err(TailnetStateError::DerpRegionChanged);
+        }
+        let router = self.router.refreshed_from_map(map)?;
+        self.router = router;
+        self.derp_peers = derp_peers;
+        Ok(())
+    }
+}
+
+enum TunnelAction<const DATAGRAM: usize> {
+    None,
+    InjectIpv4(usize),
+    Send(PeerDatagram<DATAGRAM>),
+}
+
 /// Own the verified DERP connection as a task separate from packet routing.
 ///
 /// A verified embedded-TLS operation is never cancelled: the task drains
@@ -245,6 +317,7 @@ impl<const MAX: usize> DerpPeerMap<MAX> {
 /// per-packet allocation occurs.
 pub async fn run_derp_connection<
     M: RawMutex,
+    StateMutex: RawMutex,
     T: TlsTransport,
     ProtocolRng: Rng,
     const DATAGRAM: usize,
@@ -253,7 +326,7 @@ pub async fn run_derp_connection<
 >(
     client: &mut DerpClient<'_, T>,
     disco: &DiscoSession,
-    peers: &DerpPeerMap<MAX_PEERS>,
+    state: &SharedTailnetState<StateMutex, MAX_PEERS>,
     rng: &mut ProtocolRng,
     from_tunnel: Receiver<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
     to_tunnel: Sender<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
@@ -268,7 +341,14 @@ pub async fn run_derp_connection<
         match client.receive(receive_buffer).await? {
             DerpIncoming::Packet { source, len } => {
                 if looks_like_disco(&receive_buffer[..len]) {
-                    let Some(peer_disco_key) = peers.disco_key_for(source) else {
+                    let (peer_disco_key, region_id) = state.lock(|state| {
+                        let state = state.borrow();
+                        (
+                            state.derp_peers.disco_key_for(source),
+                            state.derp_peers.region_id,
+                        )
+                    });
+                    let Some(peer_disco_key) = peer_disco_key else {
                         continue;
                     };
                     let Ok(ping) = disco.receive_ping(&receive_buffer[..len]) else {
@@ -279,13 +359,9 @@ pub async fn run_derp_connection<
                     {
                         continue;
                     }
-                    let Ok(pong) = disco.build_derp_pong(
-                        ping.source,
-                        ping.tx_id,
-                        peers.region_id,
-                        rng,
-                        disco_reply,
-                    ) else {
+                    let Ok(pong) =
+                        disco.build_derp_pong(ping.source, ping.tx_id, region_id, rng, disco_reply)
+                    else {
                         continue;
                     };
                     client.send(source, pong).await?;
@@ -334,6 +410,7 @@ pub async fn run_tunnel_timer<M: RawMutex, const QUEUE: usize>(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tailnet_tunnel<
     M: RawMutex,
+    StateMutex: RawMutex,
     C: Clock,
     Random: Rng,
     const MTU: usize,
@@ -343,7 +420,7 @@ pub async fn run_tailnet_tunnel<
     const TIMER_QUEUE: usize,
 >(
     mut packet_io: TailnetPacketIo<'_, MTU>,
-    router: &mut TailnetRouter<PEERS>,
+    state: &SharedTailnetState<StateMutex, PEERS>,
     clock: &C,
     rng: &mut Random,
     to_derp: Sender<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
@@ -361,48 +438,72 @@ pub async fn run_tailnet_tunnel<
         .await
         {
             Either3::First(Ok(length)) => {
-                if let Ok(outbound) = router.send_ipv4(clock, rng, &raw_ipv4[..length], wireguard)
-                    && let Some(packet) = PeerDatagram::new(outbound.destination, outbound.datagram)
-                {
+                let packet = state.lock(|state| {
+                    let mut state = state.borrow_mut();
+                    state
+                        .router
+                        .send_ipv4(clock, rng, &raw_ipv4[..length], wireguard)
+                        .ok()
+                        .and_then(|outbound| {
+                            PeerDatagram::new(outbound.destination, outbound.datagram)
+                        })
+                });
+                if let Some(packet) = packet {
                     to_derp.send(packet).await;
                 }
             }
             Either3::First(Err(_)) => {}
             Either3::Second(incoming) => {
-                match router.receive_derp(
-                    clock,
-                    rng,
-                    incoming.peer(),
-                    false,
-                    incoming.datagram(),
-                    wireguard,
-                ) {
-                    Ok(RouterInbound::Ipv4(packet)) => {
-                        let _ = packet_io.inject_ipv4(packet.bytes).await;
-                    }
-                    Ok(RouterInbound::Reply(outbound)) => {
-                        if let Some(packet) =
+                let action = state.lock(|state| {
+                    let mut state = state.borrow_mut();
+                    match state.router.receive_derp(
+                        clock,
+                        rng,
+                        incoming.peer(),
+                        false,
+                        incoming.datagram(),
+                        wireguard,
+                    ) {
+                        Ok(RouterInbound::Ipv4(packet)) => {
+                            TunnelAction::InjectIpv4(packet.bytes.len())
+                        }
+                        Ok(RouterInbound::Reply(outbound)) => {
                             PeerDatagram::new(outbound.destination, outbound.datagram)
-                        {
-                            to_derp.send(packet).await;
+                                .map_or(TunnelAction::None, TunnelAction::Send)
                         }
-                    }
-                    Ok(RouterInbound::HandshakeComplete(peer)) => {
-                        if let Ok(Some(outbound)) =
-                            router.flush_pending(clock, rng, peer, wireguard)
-                            && let Some(packet) =
+                        Ok(RouterInbound::HandshakeComplete(peer)) => state
+                            .router
+                            .flush_pending(clock, rng, peer, wireguard)
+                            .ok()
+                            .flatten()
+                            .and_then(|outbound| {
                                 PeerDatagram::new(outbound.destination, outbound.datagram)
-                        {
-                            to_derp.send(packet).await;
-                        }
+                            })
+                            .map_or(TunnelAction::None, TunnelAction::Send),
+                        Ok(RouterInbound::Idle) | Err(_) => TunnelAction::None,
                     }
-                    Ok(RouterInbound::Idle) | Err(_) => {}
+                });
+                match action {
+                    TunnelAction::InjectIpv4(length) => {
+                        let _ = packet_io.inject_ipv4(&wireguard[..length]).await;
+                    }
+                    TunnelAction::Send(packet) => to_derp.send(packet).await,
+                    TunnelAction::None => {}
                 }
             }
             Either3::Third(()) => {
-                if let Ok(Some(outbound)) = router.poll_next(clock, rng, wireguard)
-                    && let Some(packet) = PeerDatagram::new(outbound.destination, outbound.datagram)
-                {
+                let packet = state.lock(|state| {
+                    let mut state = state.borrow_mut();
+                    state
+                        .router
+                        .poll_next(clock, rng, wireguard)
+                        .ok()
+                        .flatten()
+                        .and_then(|outbound| {
+                            PeerDatagram::new(outbound.destination, outbound.datagram)
+                        })
+                });
+                if let Some(packet) = packet {
                     to_derp.send(packet).await;
                 }
             }
@@ -625,11 +726,8 @@ mod tests {
             >,
         >();
         let sockets = size_of::<StackResources<DEFAULT_TAILNET_SOCKET_SLOTS>>();
-        let router = size_of::<
-            tailscale_embassy_core::tunnel::TailnetRouter<
-                { tailscale_embassy_core::control::MAX_PEERS },
-            >,
-        >();
+        let control_state =
+            size_of::<TailnetControlState<{ tailscale_embassy_core::control::MAX_PEERS }>>();
         let derp_channels = 2
             * DEFAULT_TAILNET_RX_PACKETS
             * size_of::<PeerDatagram<{ tailscale_embassy_core::tunnel::WIREGUARD_BUFFER_SIZE }>>();
@@ -637,11 +735,11 @@ mod tests {
         let scratch =
             DEFAULT_TAILNET_MTU + 2 * tailscale_embassy_core::tunnel::WIREGUARD_BUFFER_SIZE;
         std::println!(
-            "driver={driver} sockets={sockets} router={router} derp_channels={derp_channels} http={http} scratch={scratch}"
+            "driver={driver} sockets={sockets} control_state={control_state} derp_channels={derp_channels} http={http} scratch={scratch}"
         );
         assert!(driver <= 7 * 1024);
         assert!(sockets <= 4 * 1024);
-        assert!(router <= 128 * 1024);
+        assert!(control_state <= 128 * 1024);
         assert!(derp_channels <= 9 * 1024);
         assert_eq!(http, 3 * 1024);
         assert!(scratch <= 6 * 1024);
@@ -676,6 +774,53 @@ mod tests {
             Some(DiscoPublicKey::parse(DISCO).unwrap())
         );
         assert!(DerpPeerMap::<0>::from_control_map(&map).is_none());
+    }
+
+    #[test]
+    fn live_control_state_applies_peer_changes_and_rejects_derp_move() {
+        const NODE_A: &str =
+            "nodekey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const NODE_B: &str =
+            "nodekey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+        let initial = tailscale_embassy_core::control::parse_map_response(
+            br#"{"Node":{"Addresses":["100.64.1.2/32"],"HomeDERP":1},"Peers":[{"ID":1,"Key":"nodekey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","Addresses":["100.100.2.3/32"]}],"DERPMap":{"Regions":{"1":{"RegionID":1,"Nodes":[{"HostName":"derp1.example"}]}}}}"#,
+        )
+        .unwrap();
+        let local_key = NodePrivateKey::from_bytes([7; 32]);
+        let mut state = TailnetControlState::<2>::from_control_map(&local_key, &initial).unwrap();
+        assert_eq!(
+            state
+                .router
+                .peer_for_destination(Ipv4Addr::new(100, 100, 2, 3)),
+            Some(NodePublicKey::parse(NODE_A).unwrap())
+        );
+
+        let changed = tailscale_embassy_core::control::parse_map_response(
+            br#"{"Node":{"Addresses":["100.64.1.2/32"],"HomeDERP":1},"Peers":[{"ID":2,"Key":"nodekey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f","Addresses":["100.100.2.4/32"]}],"DERPMap":{"Regions":{"1":{"RegionID":1,"Nodes":[{"HostName":"derp1.example"}]}}}}"#,
+        )
+        .unwrap();
+        state.apply_control_map(&changed).unwrap();
+        assert_eq!(
+            state
+                .router
+                .peer_for_destination(Ipv4Addr::new(100, 100, 2, 4)),
+            Some(NodePublicKey::parse(NODE_B).unwrap())
+        );
+        assert_eq!(
+            state
+                .router
+                .peer_for_destination(Ipv4Addr::new(100, 100, 2, 3)),
+            None
+        );
+
+        let moved = tailscale_embassy_core::control::parse_map_response(
+            br#"{"Node":{"Addresses":["100.64.1.2/32"],"HomeDERP":2},"DERPMap":{"Regions":{"2":{"RegionID":2,"Nodes":[{"HostName":"derp2.example"}]}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            state.apply_control_map(&moved),
+            Err(TailnetStateError::DerpRegionChanged)
+        );
     }
 
     #[test]
