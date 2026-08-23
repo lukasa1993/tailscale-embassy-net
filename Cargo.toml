@@ -1,0 +1,27 @@
+[package]
+name = "tailscale-embassy-net"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "embassy-net transports for tailscale-embassy-core"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+embassy-net = { version = "=0.9.1", default-features = false, features = ["dns", "medium-ethernet", "proto-ipv4", "tcp", "udp"] }
+embassy-time = { version = "=0.5.1", default-features = false }
+embedded-io-async = { version = "=0.7.0", default-features = false }
+embedded-tls = { path = "../tls-transport/vendor/embedded-tls", version = "=0.19.0", default-features = false }
+rand_core = { version = "=0.6.4", default-features = false }
+tailscale-embassy-core = { path = "../tailscale-embassy-core" }
+tls-transport = { path = "../tls-transport" }
+
+[dev-dependencies]
+critical-section = { version = "=1.2.0", features = ["std"] }
+embassy-time = { version = "=0.5.1", default-features = false, features = ["mock-driver"] }
+
+[lints.rust]
+unsafe_code = "forbid"
