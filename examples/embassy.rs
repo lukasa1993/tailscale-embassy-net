@@ -8,7 +8,7 @@ use embassy_net::Stack;
 use rand_core::CryptoRngCore;
 use tailscale_embassy_core::control::{ControlClient, ControlConfig, ControlMap, DerpNode};
 use tailscale_embassy_core::derp::DerpClient;
-use tailscale_embassy_core::{Endpoint, KeySet, Rng, Storage, TcpTransport};
+use tailscale_embassy_core::{DiscoPrivateKey, Endpoint, KeySet, Rng, Storage, TcpTransport};
 use tailscale_embassy_net::{EmbassyTcp, VerifiedTls, resolve_ipv4};
 
 const CERT_SIZE: usize = tls_transport::DEFAULT_CERT_SIZE;
@@ -36,8 +36,8 @@ pub enum ExampleError {
 /// register with a runtime auth key, and return the live map connection.
 ///
 /// Keep calling `client.next_map(map_json).await` in the owning Embassy task.
-/// The first returned map provides the local `100.x` address, fixed-peer key,
-/// peer address, and one public DERP node.
+/// The first returned map provides the control-assigned local address, dynamic
+/// peer identities/addresses, packet filter, and one public DERP node.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_and_read_first_map<
     'a,
@@ -71,6 +71,7 @@ pub async fn connect_and_read_first_map<
 ) -> Result<
     (
         KeySet,
+        DiscoPrivateKey,
         EmbassyControl<'a, ControlTlsRng, TlsClockType>,
         ControlMap,
     ),
@@ -86,6 +87,7 @@ where
     let keys = KeySet::load_or_generate(storage, protocol_rng)
         .await
         .map_err(|_| ExampleError::Identity)?;
+    let disco_key = DiscoPrivateKey::generate(protocol_rng).map_err(|_| ExampleError::Identity)?;
 
     let mut key_socket = EmbassyTcp::new(stack, key_tcp_rx, key_tcp_tx);
     TcpTransport::connect(&mut key_socket, endpoint)
@@ -122,6 +124,7 @@ where
         endpoint,
         device_hostname,
         ephemeral: false,
+        disco_key: &disco_key,
     };
     let mut client = ControlClient::connect(
         key_tls,
@@ -151,7 +154,7 @@ where
         .next_map(map_json)
         .await
         .map_err(|_| ExampleError::Control)?;
-    Ok((keys, client, first_map))
+    Ok((keys, disco_key, client, first_map))
 }
 
 /// Connect the first selected public DERP node from the authenticated map.
