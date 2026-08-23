@@ -10,19 +10,25 @@ publish = false
 
 [features]
 default = []
+host-tests = ["embassy-time/generic-queue-8", "embassy-time/std"]
 
 [dependencies]
-embassy-net = { version = "=0.9.1", default-features = false, features = ["dns", "medium-ethernet", "proto-ipv4", "tcp", "udp"] }
+embassy-futures = { version = "=0.1.2", default-features = false }
+embassy-net = { version = "=0.9.1", default-features = false, features = ["dns", "medium-ethernet", "medium-ip", "proto-ipv4", "tcp", "udp"] }
+embassy-net-driver-channel = { version = "=0.4.0", default-features = false }
+embassy-sync = { version = "=0.8.0", default-features = false }
 embassy-time = { version = "=0.5.1", default-features = false }
 embedded-io-async = { version = "=0.7.0", default-features = false }
-embedded-tls = { git = "https://github.com/lukasa1993/tls-transport", rev = "78f5b7e5ffeb44c01ae20b4ff8ade9e4cce83b5d", version = "=0.19.0", default-features = false }
+embedded-tls = { git = "https://github.com/lukasa1993/tls-transport", rev = "07e2b0d9c60cd5af241b524a9dafdd97d73856b3", version = "=0.19.0", default-features = false }
+heapless = { version = "=0.9.3", default-features = false }
+picoserve = { version = "=0.18.0", default-features = false, features = ["embassy"] }
 rand_core = { version = "=0.6.4", default-features = false }
-tailscale-embassy-core = { git = "https://github.com/lukasa1993/tailscale-embassy-core", rev = "5f103191af893fc6a17b2177c4da194b3895b203" }
-tls-transport = { git = "https://github.com/lukasa1993/tls-transport", rev = "78f5b7e5ffeb44c01ae20b4ff8ade9e4cce83b5d" }
+tailscale-embassy-core = { git = "https://github.com/lukasa1993/tailscale-embassy-core", rev = "1c8da2a52b2ea72d6663f685c88700f275eca163" }
+tls-transport = { git = "https://github.com/lukasa1993/tls-transport", rev = "07e2b0d9c60cd5af241b524a9dafdd97d73856b3" }
 
 [dev-dependencies]
 critical-section = { version = "=1.2.0", features = ["std"] }
-embassy-time = { version = "=0.5.1", default-features = false, features = ["mock-driver"] }
+pollster = "=0.4.0"
 
 [lints.rust]
 unsafe_code = "forbid"

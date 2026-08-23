@@ -7,6 +7,11 @@
 //! The socket buffers, TLS record buffers, entropy source, and clock remain
 //! caller-owned.  This crate supplies no executor and performs no allocation.
 
+#[cfg(test)]
+extern crate std;
+
+pub mod tailnet;
+
 use core::net::Ipv4Addr;
 
 use embassy_net::tcp::TcpSocket;

@@ -1,8 +1,26 @@
 //! Board-independent wiring for an Embassy application.
 //!
-//! A board crate should put every buffer below in `StaticCell`, run the
-//! `embassy-net` stack task, seed three independent CSPRNG handles from its
-//! hardware RNG, and pass its authenticated wall-clock type as `TlsClockType`.
+//! A board crate should put every buffer below in `StaticCell`, seed independent
+//! CSPRNG handles from its hardware RNG, and pass its authenticated wall-clock
+//! type as `TlsClockType`.
+//!
+//! After [`connect_and_read_first_map`] and [`connect_selected_derp`] complete,
+//! construct `TailnetRouter::from_map` and `new_tailnet_stack`, then spawn these
+//! long-lived futures as distinct Embassy tasks:
+//!
+//! 1. the physical `embassy-net` runner;
+//! 2. [`wait_for_map_change`] for the control connection;
+//! 3. `run_derp_connection` for the DERP TLS connection;
+//! 4. `run_tunnel_timer` for WireGuard timer ticks;
+//! 5. `run_tailnet_tunnel` for routing, cryptokey validation, and the IP driver;
+//! 6. the tailnet `embassy-net` runner;
+//! 7. `run_http_server` for picoserve.
+//!
+//! The DERP/tunnel channels should be
+//! `Channel<CriticalSectionRawMutex, PeerDatagram<WIREGUARD_BUFFER_SIZE>, 2>`;
+//! the timer channel needs capacity one. A full map update ends the control
+//! task and the board supervisor rebuilds the bounded peer router before
+//! reconnecting. No task runs a second HTTP listener on the physical stack.
 
 use embassy_net::Stack;
 use rand_core::CryptoRngCore;
@@ -30,6 +48,8 @@ pub enum ExampleError {
     Control,
     /// The auth key did not authorize the node.
     NotAuthorized,
+    /// The supervisor must rebuild peer/tunnel state from a fresh full map.
+    NetmapChanged,
 }
 
 /// Load the persistent identity, establish both verified TLS connections,
@@ -123,7 +143,6 @@ where
         hostname: control_hostname,
         endpoint,
         device_hostname,
-        ephemeral: false,
         disco_key: &disco_key,
     };
     let mut client = ControlClient::connect(
@@ -157,9 +176,24 @@ where
     Ok((keys, disco_key, client, first_map))
 }
 
+/// Keep the authenticated control map stream active in its own Embassy task.
+///
+/// This bounded first version deliberately asks the board supervisor to
+/// reconnect and rebuild all peer state after the next map response instead of
+/// trying to merge incremental control updates in place.
+pub async fn wait_for_map_change<T: tailscale_embassy_core::TlsTransport>(
+    client: &mut ControlClient<T>,
+    map_json: &mut [u8],
+) -> Result<(), ExampleError> {
+    let result = client.next_map(map_json).await;
+    map_json.fill(0);
+    result.map_err(|_| ExampleError::Control)?;
+    Err(ExampleError::NetmapChanged)
+}
+
 /// Connect the first selected public DERP node from the authenticated map.
-/// WireGuard output from `FixedPeerTunnel` is passed to `DerpClient::send`;
-/// `DerpClient::receive` output is passed back to the tunnel.
+/// The dedicated `run_derp_connection` task passes encrypted datagrams through
+/// bounded channels to the separate `run_tailnet_tunnel` task.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_selected_derp<'a, ProtocolRng, TlsRng, TlsClockType>(
     stack: Stack<'a>,
@@ -215,6 +249,7 @@ where
 }
 
 fn main() {
-    // See this module's documentation: a concrete board owns the executor,
-    // network device, StaticCells, hardware entropy, and authenticated clock.
+    // See this module's documentation: the concrete board owns the executor,
+    // physical device, StaticCells, hardware entropy, task spawns, reconnect
+    // supervisor, and authenticated clock.
 }

@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/lukasa1993/tailscale-embassy-net/actions/workflows/ci.yml/badge.svg)](https://github.com/lukasa1993/tailscale-embassy-net/actions/workflows/ci.yml)
 
-`embassy-net` DNS, TCP, UDP, clock, and verified TLS adapters for
+`embassy-net` DNS, TCP, UDP, clock, verified TLS adapters, and a bounded
+raw-IPv4 tailnet stack for
 [`tailscale-embassy-core`](https://github.com/lukasa1993/tailscale-embassy-core).
 The crate is `#![no_std]`, uses async Embassy APIs, and keeps network and TLS
 buffers caller-owned.
@@ -27,6 +28,7 @@ Pin a reviewed Git revision in consuming firmware.
 
 ```sh
 cargo test --all-targets
+cargo test --features host-tests raw_ipv4_injection_drives_tcp_syn_syn_ack_and_picoserve
 rustup target add thumbv7em-none-eabihf
 cargo check --target thumbv7em-none-eabihf --no-default-features
 ```
