@@ -288,6 +288,10 @@ impl<const MAX: usize> TailnetControlState<MAX> {
     /// A local-address or home-DERP change requires rebuilding infrastructure
     /// outside this state object and is rejected instead of applying an unsafe
     /// partial update.
+    // Keep both bounded routing candidates in this callee's phase. Firmware
+    // callers decode a bounded RawMap immediately before applying the state;
+    // LTO must not merge those two large stack frames on constrained targets.
+    #[inline(never)]
     pub fn apply_control_map(&mut self, map: &ControlMap) -> Result<(), TailnetStateError> {
         let derp_peers =
             DerpPeerMap::from_control_map(map).ok_or(TailnetStateError::PeerCapacity)?;
