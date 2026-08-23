@@ -2,9 +2,10 @@
 name = "tailscale-embassy-net"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.93"
 license = "MIT OR Apache-2.0"
 description = "embassy-net transports for tailscale-embassy-core"
+repository = "https://github.com/lukasa1993/tailscale-embassy-net"
 publish = false
 
 [features]
@@ -14,10 +15,10 @@ default = []
 embassy-net = { version = "=0.9.1", default-features = false, features = ["dns", "medium-ethernet", "proto-ipv4", "tcp", "udp"] }
 embassy-time = { version = "=0.5.1", default-features = false }
 embedded-io-async = { version = "=0.7.0", default-features = false }
-embedded-tls = { path = "../tls-transport/vendor/embedded-tls", version = "=0.19.0", default-features = false }
+embedded-tls = { git = "https://github.com/lukasa1993/tls-transport", rev = "78f5b7e5ffeb44c01ae20b4ff8ade9e4cce83b5d", version = "=0.19.0", default-features = false }
 rand_core = { version = "=0.6.4", default-features = false }
-tailscale-embassy-core = { path = "../tailscale-embassy-core" }
-tls-transport = { path = "../tls-transport" }
+tailscale-embassy-core = { git = "https://github.com/lukasa1993/tailscale-embassy-core", rev = "5f103191af893fc6a17b2177c4da194b3895b203" }
+tls-transport = { git = "https://github.com/lukasa1993/tls-transport", rev = "78f5b7e5ffeb44c01ae20b4ff8ade9e4cce83b5d" }
 
 [dev-dependencies]
 critical-section = { version = "=1.2.0", features = ["std"] }
