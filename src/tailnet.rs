@@ -298,8 +298,7 @@ impl<const MAX: usize> TailnetControlState<MAX> {
         if derp_peers.region_id != self.derp_peers.region_id {
             return Err(TailnetStateError::DerpRegionChanged);
         }
-        let router = self.router.refreshed_from_map(map)?;
-        self.router = router;
+        self.router.refresh_from_map(map)?;
         self.derp_peers = derp_peers;
         Ok(())
     }
