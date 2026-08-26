@@ -3,7 +3,7 @@
 use core::cell::RefCell;
 use core::net::Ipv4Addr;
 
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_net::{Config, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embassy_net_driver_channel::driver::{HardwareAddress, LinkState};
 use embassy_net_driver_channel::{Device, Runner, State};
@@ -19,7 +19,8 @@ use tailscale_embassy_core::disco::{DiscoSession, looks_like_disco};
 use tailscale_embassy_core::packet::{PacketError, parse_ipv4};
 use tailscale_embassy_core::tunnel::{RouterError, RouterInbound, TailnetRouter};
 use tailscale_embassy_core::{
-    Clock, DiscoPublicKey, NodePrivateKey, NodePublicKey, Rng, TlsTransport,
+    Clock, DiscoPublicKey, Endpoint, NodePrivateKey, NodePublicKey, Rng, TlsTransport,
+    TransportError, UdpTransport,
 };
 
 /// Tailscale's IPv4 CGNAT route length (`100.64.0.0/10`).
@@ -150,6 +151,48 @@ pub struct PeerDatagram<const SIZE: usize> {
     bytes: [u8; SIZE],
 }
 
+/// One WireGuard datagram routed to an authenticated direct UDP endpoint.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DirectDatagram<const SIZE: usize> {
+    endpoint: Endpoint,
+    packet: PeerDatagram<SIZE>,
+}
+
+impl<const SIZE: usize> DirectDatagram<SIZE> {
+    /// Copy a complete peer datagram and its validated UDP destination.
+    pub fn new(peer: NodePublicKey, endpoint: Endpoint, datagram: &[u8]) -> Option<Self> {
+        Some(Self {
+            endpoint,
+            packet: PeerDatagram::new(peer, datagram)?,
+        })
+    }
+
+    /// Validated direct UDP destination.
+    pub const fn endpoint(&self) -> Endpoint {
+        self.endpoint
+    }
+
+    /// Intended peer node key.
+    pub const fn peer(&self) -> NodePublicKey {
+        self.packet.peer()
+    }
+
+    /// WireGuard datagram without channel padding.
+    pub fn datagram(&self) -> &[u8] {
+        self.packet.datagram()
+    }
+}
+
+impl<const SIZE: usize> core::fmt::Debug for DirectDatagram<SIZE> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DirectDatagram")
+            .field("endpoint", &self.endpoint)
+            .field("peer", &self.peer())
+            .field("len", &self.datagram().len())
+            .finish()
+    }
+}
+
 impl<const SIZE: usize> PeerDatagram<SIZE> {
     /// Copy a complete datagram into task-owned channel storage.
     pub fn new(peer: NodePublicKey, datagram: &[u8]) -> Option<Self> {
@@ -205,6 +248,7 @@ impl From<DerpError> for DerpTaskError {
 pub struct DerpPeer {
     node_key: NodePublicKey,
     disco_key: Option<DiscoPublicKey>,
+    direct_endpoint: Option<Endpoint>,
 }
 
 /// Compact, immutable projection of an authenticated control map for DERP.
@@ -227,6 +271,7 @@ impl<const MAX: usize> DerpPeerMap<MAX> {
                 .push(DerpPeer {
                     node_key: peer.key,
                     disco_key: peer.disco_key,
+                    direct_endpoint: None,
                 })
                 .ok()?;
         }
@@ -241,6 +286,40 @@ impl<const MAX: usize> DerpPeerMap<MAX> {
             .iter()
             .find(|peer| peer.node_key == node_key)
             .and_then(|peer| peer.disco_key)
+    }
+
+    fn authenticate_direct_ping(
+        &mut self,
+        source: DiscoPublicKey,
+        claimed_node: Option<NodePublicKey>,
+        endpoint: Endpoint,
+    ) -> Option<NodePublicKey> {
+        if endpoint.port == 0 {
+            return None;
+        }
+        let peer = self
+            .peers
+            .iter_mut()
+            .find(|peer| peer.disco_key == Some(source))?;
+        if claimed_node.is_some_and(|claimed| claimed != peer.node_key) {
+            return None;
+        }
+        peer.direct_endpoint = Some(endpoint);
+        Some(peer.node_key)
+    }
+
+    fn peer_for_direct_endpoint(&self, endpoint: Endpoint) -> Option<NodePublicKey> {
+        self.peers
+            .iter()
+            .find(|peer| peer.direct_endpoint == Some(endpoint))
+            .map(|peer| peer.node_key)
+    }
+
+    fn direct_endpoint_for(&self, node_key: NodePublicKey) -> Option<Endpoint> {
+        self.peers
+            .iter()
+            .find(|peer| peer.node_key == node_key)
+            .and_then(|peer| peer.direct_endpoint)
     }
 }
 
@@ -298,14 +377,104 @@ impl<const MAX: usize> TailnetControlState<MAX> {
     // LTO must not merge those two large stack frames on constrained targets.
     #[inline(never)]
     pub fn apply_control_map(&mut self, map: &ControlMap) -> Result<(), TailnetStateError> {
-        let derp_peers =
+        let mut derp_peers =
             DerpPeerMap::from_control_map(map).ok_or(TailnetStateError::PeerCapacity)?;
         if derp_peers.region_id != self.derp_peers.region_id {
             return Err(TailnetStateError::DerpRegionChanged);
         }
         self.router.refresh_from_map(map)?;
+        for refreshed in &mut derp_peers.peers {
+            if let Some(current) = self.derp_peers.peers.iter().find(|current| {
+                current.node_key == refreshed.node_key && current.disco_key == refreshed.disco_key
+            }) {
+                refreshed.direct_endpoint = current.direct_endpoint;
+            }
+        }
         self.derp_peers = derp_peers;
         Ok(())
+    }
+}
+
+/// Fatal failure of the direct UDP socket task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectTaskError {
+    /// The bound Embassy UDP transport failed.
+    Transport(TransportError),
+}
+
+impl From<TransportError> for DirectTaskError {
+    fn from(error: TransportError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+/// Own one already-bound UDP socket for encrypted disco and WireGuard traffic.
+///
+/// A peer endpoint becomes usable only after an authenticated disco Ping from
+/// the peer's control-plane disco key. Non-disco WireGuard packets are then
+/// accepted only from that exact observed endpoint.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_direct_udp<
+    M: RawMutex,
+    StateMutex: RawMutex,
+    U: UdpTransport,
+    ProtocolRng: Rng,
+    const DATAGRAM: usize,
+    const QUEUE: usize,
+    const MAX_PEERS: usize,
+>(
+    socket: &mut U,
+    disco: &DiscoSession,
+    state: &SharedTailnetState<StateMutex, MAX_PEERS>,
+    rng: &mut ProtocolRng,
+    from_tunnel: Receiver<'_, M, DirectDatagram<DATAGRAM>, QUEUE>,
+    to_tunnel: Sender<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
+    receive_buffer: &mut [u8],
+    disco_reply: &mut [u8],
+) -> Result<(), DirectTaskError> {
+    loop {
+        match select(socket.recv_from(receive_buffer), from_tunnel.receive()).await {
+            Either::First(received) => {
+                let (length, source) = received?;
+                if looks_like_disco(&receive_buffer[..length]) {
+                    let Ok(ping) = disco.receive_ping(&receive_buffer[..length]) else {
+                        continue;
+                    };
+                    let peer = state.lock(|state| {
+                        state.borrow_mut().derp_peers.authenticate_direct_ping(
+                            ping.source,
+                            ping.node_key,
+                            source,
+                        )
+                    });
+                    let Some(_peer) = peer else {
+                        continue;
+                    };
+                    let Ok(pong) =
+                        disco.build_pong(ping.source, ping.tx_id, source, rng, disco_reply)
+                    else {
+                        continue;
+                    };
+                    socket.send_to(source, pong).await?;
+                    continue;
+                }
+
+                let peer =
+                    state.lock(|state| state.borrow().derp_peers.peer_for_direct_endpoint(source));
+                let Some(peer) = peer else {
+                    continue;
+                };
+                let Some(packet) = PeerDatagram::new(peer, &receive_buffer[..length]) else {
+                    continue;
+                };
+                to_tunnel.send(packet).await;
+            }
+            Either::Second(outbound) => {
+                socket
+                    .send_to(outbound.endpoint(), outbound.datagram())
+                    .await?;
+            }
+        }
     }
 }
 
@@ -416,6 +585,33 @@ pub async fn run_tunnel_timer<M: RawMutex, const QUEUE: usize>(
 /// Invalid, spoofed, unauthorized, unknown-peer, and malformed packets are
 /// deliberately dropped. The dedicated control task supplies a fresh router
 /// after a full netmap update or reconnect.
+async fn dispatch_underlay<
+    M: RawMutex,
+    StateMutex: RawMutex,
+    const PEERS: usize,
+    const DATAGRAM: usize,
+    const QUEUE: usize,
+>(
+    state: &SharedTailnetState<StateMutex, PEERS>,
+    packet: PeerDatagram<DATAGRAM>,
+    to_derp: &Sender<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
+    to_direct: &Sender<'_, M, DirectDatagram<DATAGRAM>, QUEUE>,
+) {
+    let endpoint = state.lock(|state| state.borrow().derp_peers.direct_endpoint_for(packet.peer()));
+    let Some(endpoint) = endpoint else {
+        to_derp.send(packet).await;
+        return;
+    };
+    let Some(direct) = DirectDatagram::new(packet.peer(), endpoint, packet.datagram()) else {
+        to_derp.send(packet).await;
+        return;
+    };
+    // The authenticated direct path is latency-critical. Mirror opportunistically
+    // to DERP so relay fallback remains available without ever blocking UDP.
+    to_direct.send(direct).await;
+    let _ = to_derp.try_send(packet);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tailnet_tunnel<
     M: RawMutex,
@@ -434,19 +630,22 @@ pub async fn run_tailnet_tunnel<
     rng: &mut Random,
     to_derp: Sender<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
     from_derp: Receiver<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
+    to_direct: Sender<'_, M, DirectDatagram<DATAGRAM>, QUEUE>,
+    from_direct: Receiver<'_, M, PeerDatagram<DATAGRAM>, QUEUE>,
     timer_ticks: Receiver<'_, M, (), TIMER_QUEUE>,
     raw_ipv4: &mut [u8],
     wireguard: &mut [u8],
 ) -> ! {
     loop {
-        match select3(
+        match select4(
             packet_io.receive_outbound(raw_ipv4),
             from_derp.receive(),
+            from_direct.receive(),
             timer_ticks.receive(),
         )
         .await
         {
-            Either3::First(Ok(length)) => {
+            Either4::First(Ok(length)) => {
                 let outbound = state.lock(|state| {
                     let mut state = state.borrow_mut();
                     state
@@ -458,7 +657,7 @@ pub async fn run_tailnet_tunnel<
                         if let Some(packet) =
                             PeerDatagram::new(outbound.destination, outbound.datagram)
                         {
-                            to_derp.send(packet).await;
+                            dispatch_underlay(state, packet, &to_derp, &to_direct).await;
                         }
                     }
                     Err(_error) => {
@@ -470,8 +669,8 @@ pub async fn run_tailnet_tunnel<
                     }
                 }
             }
-            Either3::First(Err(_)) => {}
-            Either3::Second(incoming) => {
+            Either4::First(Err(_)) => {}
+            Either4::Second(incoming) | Either4::Third(incoming) => {
                 let action = state.lock(|state| {
                     let mut state = state.borrow_mut();
                     match state.router.receive_derp(
@@ -502,7 +701,7 @@ pub async fn run_tailnet_tunnel<
                         Err(_error) => {
                             #[cfg(feature = "defmt")]
                             defmt::warn!(
-                                "tailnet inbound DERP datagram dropped: {:?}",
+                                "tailnet inbound underlay datagram dropped: {:?}",
                                 defmt::Debug2Format(&_error)
                             );
                             TunnelAction::None
@@ -516,11 +715,13 @@ pub async fn run_tailnet_tunnel<
                             defmt::warn!("tailnet IPv4 injection dropped");
                         }
                     }
-                    TunnelAction::Send(packet) => to_derp.send(packet).await,
+                    TunnelAction::Send(packet) => {
+                        dispatch_underlay(state, packet, &to_derp, &to_direct).await
+                    }
                     TunnelAction::None => {}
                 }
             }
-            Either3::Third(()) => {
+            Either4::Fourth(()) => {
                 let outbound = state.lock(|state| {
                     let mut state = state.borrow_mut();
                     state.router.poll_next(clock, rng, wireguard)
@@ -530,7 +731,7 @@ pub async fn run_tailnet_tunnel<
                         if let Some(packet) =
                             PeerDatagram::new(outbound.destination, outbound.datagram)
                         {
-                            to_derp.send(packet).await;
+                            dispatch_underlay(state, packet, &to_derp, &to_direct).await;
                         }
                     }
                     Ok(None) => {}
@@ -809,12 +1010,26 @@ mod tests {
         )
         .unwrap();
 
-        let projected = DerpPeerMap::<1>::from_control_map(&map).unwrap();
+        let mut projected = DerpPeerMap::<1>::from_control_map(&map).unwrap();
         let node = NodePublicKey::parse(NODE).unwrap();
+        let disco = DiscoPublicKey::parse(DISCO).unwrap();
+        assert_eq!(projected.disco_key_for(node), Some(disco));
+        let endpoint = Endpoint::new(Ipv4Addr::new(192, 168, 1, 9), 41641);
         assert_eq!(
-            projected.disco_key_for(node),
-            Some(DiscoPublicKey::parse(DISCO).unwrap())
+            projected.authenticate_direct_ping(disco, Some(node), endpoint),
+            Some(node)
         );
+        assert_eq!(projected.peer_for_direct_endpoint(endpoint), Some(node));
+        assert_eq!(projected.direct_endpoint_for(node), Some(endpoint));
+        assert_eq!(
+            projected.authenticate_direct_ping(
+                disco,
+                Some(NodePublicKey::from_bytes([9; 32])),
+                Endpoint::new(Ipv4Addr::new(192, 168, 1, 10), 41641),
+            ),
+            None
+        );
+        assert_eq!(projected.direct_endpoint_for(node), Some(endpoint));
         assert!(DerpPeerMap::<0>::from_control_map(&map).is_none());
     }
 
