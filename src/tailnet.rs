@@ -383,15 +383,23 @@ impl<const MAX: usize> TailnetControlState<MAX> {
             return Err(TailnetStateError::DerpRegionChanged);
         }
         self.router.refresh_from_map(map)?;
-        for refreshed in &mut derp_peers.peers {
-            if let Some(current) = self.derp_peers.peers.iter().find(|current| {
-                current.node_key == refreshed.node_key && current.disco_key == refreshed.disco_key
-            }) {
-                refreshed.direct_endpoint = current.direct_endpoint;
-            }
-        }
+        retain_authenticated_endpoints(&self.derp_peers, &mut derp_peers);
         self.derp_peers = derp_peers;
         Ok(())
+    }
+}
+
+fn retain_authenticated_endpoints<const MAX: usize>(
+    current: &DerpPeerMap<MAX>,
+    refreshed: &mut DerpPeerMap<MAX>,
+) {
+    for refreshed_peer in &mut refreshed.peers {
+        if let Some(current_peer) = current.peers.iter().find(|current_peer| {
+            current_peer.node_key == refreshed_peer.node_key
+                && current_peer.disco_key == refreshed_peer.disco_key
+        }) {
+            refreshed_peer.direct_endpoint = current_peer.direct_endpoint;
+        }
     }
 }
 
@@ -1031,6 +1039,71 @@ mod tests {
         );
         assert_eq!(projected.direct_endpoint_for(node), Some(endpoint));
         assert!(DerpPeerMap::<0>::from_control_map(&map).is_none());
+    }
+
+    #[test]
+    fn peer_datagram_accepts_exact_capacity_and_rejects_one_byte_more() {
+        let peer = NodePublicKey::from_bytes([3; 32]);
+        let exact = PeerDatagram::<4>::new(peer, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(exact.peer(), peer);
+        assert_eq!(exact.datagram(), &[1, 2, 3, 4]);
+        assert!(PeerDatagram::<4>::new(peer, &[1, 2, 3, 4, 5]).is_none());
+    }
+
+    #[test]
+    fn map_refresh_preserves_direct_endpoint_only_for_exact_peer_identity() {
+        const NODE_A: &str =
+            "nodekey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const NODE_B: &str =
+            "nodekey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+        const DISCO_A: &str =
+            "discokey:404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f";
+        const DISCO_B: &str =
+            "discokey:606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f";
+        let initial = tailscale_embassy_core::control::parse_map_response(
+            br#"{"Node":{"Addresses":["100.64.1.2/32"],"HomeDERP":1},"Peers":[{"ID":1,"Key":"nodekey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","DiscoKey":"discokey:404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f","Addresses":["100.100.2.3/32"]}],"DERPMap":{"Regions":{"1":{"RegionID":1,"Nodes":[{"HostName":"derp1.example"}]}}}}"#,
+        )
+        .unwrap();
+        let local_key = NodePrivateKey::from_bytes([7; 32]);
+        let mut state = TailnetControlState::<2>::from_control_map(&local_key, &initial).unwrap();
+        let node_a = NodePublicKey::parse(NODE_A).unwrap();
+        let disco_a = DiscoPublicKey::parse(DISCO_A).unwrap();
+        let endpoint = Endpoint::new(Ipv4Addr::new(192, 168, 1, 9), 41641);
+        assert_eq!(
+            state
+                .derp_peers
+                .authenticate_direct_ping(disco_a, Some(node_a), endpoint),
+            Some(node_a)
+        );
+
+        state.apply_control_map(&initial).unwrap();
+        assert_eq!(state.derp_peers.direct_endpoint_for(node_a), Some(endpoint));
+
+        let changed_disco = tailscale_embassy_core::control::parse_map_response(
+            br#"{"Node":{"Addresses":["100.64.1.2/32"],"HomeDERP":1},"Peers":[{"ID":1,"Key":"nodekey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","DiscoKey":"discokey:606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f","Addresses":["100.100.2.3/32"]}],"DERPMap":{"Regions":{"1":{"RegionID":1,"Nodes":[{"HostName":"derp1.example"}]}}}}"#,
+        )
+        .unwrap();
+        state.apply_control_map(&changed_disco).unwrap();
+        assert_eq!(state.derp_peers.direct_endpoint_for(node_a), None);
+
+        let disco_b = DiscoPublicKey::parse(DISCO_B).unwrap();
+        assert_eq!(
+            state
+                .derp_peers
+                .authenticate_direct_ping(disco_b, Some(node_a), endpoint),
+            Some(node_a)
+        );
+        let changed_node = tailscale_embassy_core::control::parse_map_response(
+            br#"{"Node":{"Addresses":["100.64.1.2/32"],"HomeDERP":1},"Peers":[{"ID":2,"Key":"nodekey:202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f","DiscoKey":"discokey:606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f","Addresses":["100.100.2.4/32"]}],"DERPMap":{"Regions":{"1":{"RegionID":1,"Nodes":[{"HostName":"derp1.example"}]}}}}"#,
+        )
+        .unwrap();
+        state.apply_control_map(&changed_node).unwrap();
+        assert_eq!(
+            state
+                .derp_peers
+                .direct_endpoint_for(NodePublicKey::parse(NODE_B).unwrap()),
+            None
+        );
     }
 
     #[test]
