@@ -21,12 +21,12 @@ embassy-net-driver-channel = { version = "=0.4.0", default-features = false }
 embassy-sync = { version = "=0.8.0", default-features = false }
 embassy-time = { version = "=0.5.1", default-features = false }
 embedded-io-async = { version = "=0.7.0", default-features = false }
-embedded-tls = { git = "https://github.com/lukasa1993/tls-transport", rev = "424dac4151571f9c87d060649aa51d51439bfb59", version = "=0.19.0", default-features = false }
+embedded-tls = { git = "https://github.com/lukasa1993/tls-transport", rev = "eb02211d352cf86e31b4db34c119ed7ffee6629f", version = "=0.19.0", default-features = false }
 heapless = { version = "=0.9.3", default-features = false }
 picoserve = { version = "=0.18.0", default-features = false, features = ["embassy"] }
 rand_core = { version = "=0.6.4", default-features = false }
 tailscale-embassy-core = { git = "https://github.com/lukasa1993/tailscale-embassy-core", rev = "2ac8312f105aa8db4f1df02bb941bca854621458" }
-tls-transport = { git = "https://github.com/lukasa1993/tls-transport", rev = "424dac4151571f9c87d060649aa51d51439bfb59" }
+tls-transport = { git = "https://github.com/lukasa1993/tls-transport", rev = "eb02211d352cf86e31b4db34c119ed7ffee6629f" }
 
 [dev-dependencies]
 critical-section = { version = "=1.2.0", features = ["std"] }
