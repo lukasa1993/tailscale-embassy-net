@@ -25,7 +25,7 @@ embedded-tls = { git = "https://github.com/lukasa1993/tls-transport", rev = "424
 heapless = { version = "=0.9.3", default-features = false }
 picoserve = { version = "=0.18.0", default-features = false, features = ["embassy"] }
 rand_core = { version = "=0.6.4", default-features = false }
-tailscale-embassy-core = { git = "https://github.com/lukasa1993/tailscale-embassy-core", rev = "bf3a357fff8c4a68a009c43473709dd84f3081ad" }
+tailscale-embassy-core = { git = "https://github.com/lukasa1993/tailscale-embassy-core", rev = "2ac8312f105aa8db4f1df02bb941bca854621458" }
 tls-transport = { git = "https://github.com/lukasa1993/tls-transport", rev = "424dac4151571f9c87d060649aa51d51439bfb59" }
 
 [dev-dependencies]

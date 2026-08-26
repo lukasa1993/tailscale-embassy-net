@@ -15,7 +15,7 @@ use heapless::Vec;
 use picoserve::io::Write as _;
 use tailscale_embassy_core::control::ControlMap;
 use tailscale_embassy_core::derp::{DerpClient, DerpError, DerpIncoming};
-use tailscale_embassy_core::disco::{DiscoSession, looks_like_disco};
+use tailscale_embassy_core::disco::{DiscoPing, DiscoSession, looks_like_disco};
 use tailscale_embassy_core::packet::{PacketError, parse_ipv4};
 use tailscale_embassy_core::tunnel::{RouterError, RouterInbound, TailnetRouter};
 use tailscale_embassy_core::{
@@ -543,9 +543,7 @@ pub async fn run_derp_connection<
                     let Ok(ping) = disco.receive_ping(&receive_buffer[..len]) else {
                         continue;
                     };
-                    if peer_disco_key != ping.source
-                        || ping.node_key.is_some_and(|claimed| claimed != source)
-                    {
+                    if !derp_ping_matches_peer(peer_disco_key, ping, source) {
                         continue;
                     }
                     let Ok(pong) =
@@ -572,6 +570,14 @@ pub async fn run_derp_connection<
             DerpIncoming::Activity | DerpIncoming::Health { .. } => {}
         }
     }
+}
+
+fn derp_ping_matches_peer(
+    expected_disco_key: DiscoPublicKey,
+    ping: DiscoPing,
+    source_peer: NodePublicKey,
+) -> bool {
+    expected_disco_key == ping.source && ping.node_key.is_none_or(|claimed| claimed == source_peer)
 }
 
 /// Periodically wake WireGuard timer processing without busy-polling.
@@ -685,7 +691,7 @@ pub async fn run_tailnet_tunnel<
                         clock,
                         rng,
                         incoming.peer(),
-                        false,
+                        bool::default(),
                         incoming.datagram(),
                         wireguard,
                     ) {
@@ -857,37 +863,68 @@ impl picoserve::io::Write for ReasonPhraseWriter<'_> {
         }
 
         let mut consumed = 0;
-        while consumed < bytes.len() && self.first_line_len < self.first_line.len() {
+        while capture_first_line_byte(
+            consumed,
+            bytes.len(),
+            self.first_line_len,
+            self.first_line.len(),
+        ) {
             self.first_line[self.first_line_len] = bytes[consumed];
             self.first_line_len += 1;
             consumed += 1;
             if self.first_line[..self.first_line_len].ends_with(b"\r\n") {
-                self.write_first_line().await?;
-                if consumed < bytes.len() {
-                    self.inner.write_all(&bytes[consumed..]).await?;
-                }
-                return Ok(bytes.len());
+                return self.finish_first_line(bytes, consumed).await;
             }
         }
 
-        if self.first_line_len == self.first_line.len() {
-            self.write_first_line().await?;
-            if consumed < bytes.len() {
-                self.inner.write_all(&bytes[consumed..]).await?;
-            }
+        if first_line_is_full(self.first_line_len, self.first_line.len()) {
+            return self.finish_first_line(bytes, consumed).await;
         }
         Ok(bytes.len())
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        if !self.first_line_written && self.first_line_len != 0 {
+        if should_flush_first_line(self.first_line_written, self.first_line_len) {
             self.write_first_line().await?;
         }
         self.inner.flush().await
     }
 }
 
+fn capture_first_line_byte(
+    consumed: usize,
+    input_len: usize,
+    first_line_len: usize,
+    first_line_capacity: usize,
+) -> bool {
+    consumed < input_len && first_line_len < first_line_capacity
+}
+
+fn has_unwritten_bytes(consumed: usize, input_len: usize) -> bool {
+    consumed < input_len
+}
+
+fn first_line_is_full(first_line_len: usize, first_line_capacity: usize) -> bool {
+    first_line_len == first_line_capacity
+}
+
+fn should_flush_first_line(first_line_written: bool, first_line_len: usize) -> bool {
+    !first_line_written && first_line_len != 0
+}
+
 impl ReasonPhraseWriter<'_> {
+    async fn finish_first_line(
+        &mut self,
+        bytes: &[u8],
+        consumed: usize,
+    ) -> Result<usize, embassy_net::tcp::Error> {
+        self.write_first_line().await?;
+        if has_unwritten_bytes(consumed, bytes.len()) {
+            self.inner.write_all(&bytes[consumed..]).await?;
+        }
+        Ok(bytes.len())
+    }
+
     async fn write_first_line(&mut self) -> Result<(), embassy_net::tcp::Error> {
         const PICOSERVE_OK: &[u8] = b"HTTP/1.1 200 \r\n";
         const REQUIRED_OK: &[u8] = b"HTTP/1.1 200 OK\r\n";
@@ -1048,6 +1085,41 @@ mod tests {
         assert_eq!(exact.peer(), peer);
         assert_eq!(exact.datagram(), &[1, 2, 3, 4]);
         assert!(PeerDatagram::<4>::new(peer, &[1, 2, 3, 4, 5]).is_none());
+    }
+
+    #[test]
+    fn derp_disco_identity_and_reason_phrase_boundaries_fail_closed() {
+        let peer = NodePublicKey::from_bytes([3; 32]);
+        let other_peer = NodePublicKey::from_bytes([4; 32]);
+        let disco = DiscoPublicKey::from_bytes([5; 32]);
+        let other_disco = DiscoPublicKey::from_bytes([6; 32]);
+        let ping = DiscoPing {
+            source: disco,
+            tx_id: [7; 12],
+            node_key: Some(peer),
+        };
+        assert!(derp_ping_matches_peer(disco, ping, peer));
+        assert!(derp_ping_matches_peer(
+            disco,
+            DiscoPing {
+                node_key: None,
+                ..ping
+            },
+            peer
+        ));
+        assert!(!derp_ping_matches_peer(other_disco, ping, peer));
+        assert!(!derp_ping_matches_peer(disco, ping, other_peer));
+
+        assert!(capture_first_line_byte(0, 1, 0, 32));
+        assert!(!capture_first_line_byte(1, 1, 0, 32));
+        assert!(!capture_first_line_byte(0, 1, 32, 32));
+        assert!(has_unwritten_bytes(0, 1));
+        assert!(!has_unwritten_bytes(1, 1));
+        assert!(first_line_is_full(32, 32));
+        assert!(!first_line_is_full(31, 32));
+        assert!(should_flush_first_line(false, 1));
+        assert!(!should_flush_first_line(true, 1));
+        assert!(!should_flush_first_line(false, 0));
     }
 
     #[test]
