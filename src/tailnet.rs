@@ -43,6 +43,11 @@ pub const DEFAULT_HTTP_TCP_TX_SIZE: usize = 1024;
 /// Time after each received DERP packet for the tunnel and TCP stack to queue
 /// immediate response traffic before the next non-cancellable TLS read.
 pub const DEFAULT_DERP_REPLY_DRAIN: Duration = Duration::from_millis(25);
+/// Maximum DERP sends before the task must service another inbound frame.
+///
+/// Strict alternation prevents a TCP retransmit producer from filling the
+/// relay/TLS buffers with duplicate segments before the peer ACK is serviced.
+pub const MAX_DERP_SEND_BURST: usize = 1;
 
 /// Caller-owned fixed packet storage used by the IP-native channel driver.
 pub type TailnetDriverState<const MTU: usize, const RX: usize, const TX: usize> =
@@ -318,6 +323,7 @@ enum TunnelAction<const DATAGRAM: usize> {
 /// This ordering covers inbound TCP response traffic without poisoning the TLS
 /// state. Both channels are bounded and copy at most `DATAGRAM` bytes; no
 /// per-packet allocation occurs.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_derp_connection<
     M: RawMutex,
     StateMutex: RawMutex,
@@ -337,7 +343,10 @@ pub async fn run_derp_connection<
     disco_reply: &mut [u8],
 ) -> Result<(), DerpTaskError> {
     loop {
-        while let Ok(outbound) = from_tunnel.try_receive() {
+        for _ in 0..MAX_DERP_SEND_BURST {
+            let Ok(outbound) = from_tunnel.try_receive() else {
+                break;
+            };
             client.send(outbound.peer(), outbound.datagram()).await?;
         }
 
@@ -379,9 +388,6 @@ pub async fn run_derp_connection<
                     with_timeout(DEFAULT_DERP_REPLY_DRAIN, from_tunnel.receive()).await
                 {
                     client.send(outbound.peer(), outbound.datagram()).await?;
-                    while let Ok(outbound) = from_tunnel.try_receive() {
-                        client.send(outbound.peer(), outbound.datagram()).await?;
-                    }
                 }
             }
             DerpIncoming::PeerGone(_) => {}
@@ -441,18 +447,27 @@ pub async fn run_tailnet_tunnel<
         .await
         {
             Either3::First(Ok(length)) => {
-                let packet = state.lock(|state| {
+                let outbound = state.lock(|state| {
                     let mut state = state.borrow_mut();
                     state
                         .router
                         .send_ipv4(clock, rng, &raw_ipv4[..length], wireguard)
-                        .ok()
-                        .and_then(|outbound| {
-                            PeerDatagram::new(outbound.destination, outbound.datagram)
-                        })
                 });
-                if let Some(packet) = packet {
-                    to_derp.send(packet).await;
+                match outbound {
+                    Ok(outbound) => {
+                        if let Some(packet) =
+                            PeerDatagram::new(outbound.destination, outbound.datagram)
+                        {
+                            to_derp.send(packet).await;
+                        }
+                    }
+                    Err(_error) => {
+                        #[cfg(feature = "defmt")]
+                        defmt::warn!(
+                            "tailnet outbound IPv4 dropped: {:?}",
+                            defmt::Debug2Format(&_error)
+                        );
+                    }
                 }
             }
             Either3::First(Err(_)) => {}
@@ -483,31 +498,49 @@ pub async fn run_tailnet_tunnel<
                                 PeerDatagram::new(outbound.destination, outbound.datagram)
                             })
                             .map_or(TunnelAction::None, TunnelAction::Send),
-                        Ok(RouterInbound::Idle) | Err(_) => TunnelAction::None,
+                        Ok(RouterInbound::Idle) => TunnelAction::None,
+                        Err(_error) => {
+                            #[cfg(feature = "defmt")]
+                            defmt::warn!(
+                                "tailnet inbound DERP datagram dropped: {:?}",
+                                defmt::Debug2Format(&_error)
+                            );
+                            TunnelAction::None
+                        }
                     }
                 });
                 match action {
                     TunnelAction::InjectIpv4(length) => {
-                        let _ = packet_io.inject_ipv4(&wireguard[..length]).await;
+                        if packet_io.inject_ipv4(&wireguard[..length]).await.is_err() {
+                            #[cfg(feature = "defmt")]
+                            defmt::warn!("tailnet IPv4 injection dropped");
+                        }
                     }
                     TunnelAction::Send(packet) => to_derp.send(packet).await,
                     TunnelAction::None => {}
                 }
             }
             Either3::Third(()) => {
-                let packet = state.lock(|state| {
+                let outbound = state.lock(|state| {
                     let mut state = state.borrow_mut();
-                    state
-                        .router
-                        .poll_next(clock, rng, wireguard)
-                        .ok()
-                        .flatten()
-                        .and_then(|outbound| {
-                            PeerDatagram::new(outbound.destination, outbound.datagram)
-                        })
+                    state.router.poll_next(clock, rng, wireguard)
                 });
-                if let Some(packet) = packet {
-                    to_derp.send(packet).await;
+                match outbound {
+                    Ok(Some(outbound)) => {
+                        if let Some(packet) =
+                            PeerDatagram::new(outbound.destination, outbound.datagram)
+                        {
+                            to_derp.send(packet).await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_error) => {
+                        #[cfg(feature = "defmt")]
+                        defmt::warn!(
+                            "tailnet WireGuard timer dropped: {:?}",
+                            defmt::Debug2Format(&_error)
+                        );
+                    }
                 }
             }
         }
@@ -698,7 +731,13 @@ impl<'s> picoserve::io::Socket<picoserve::EmbassyRuntime> for ReasonPhraseSocket
         timeouts: &picoserve::Timeouts,
         timer: &mut T,
     ) -> Result<(), picoserve::Error<Self::Error>> {
-        picoserve::io::Socket::shutdown(self.0, timeouts, timer).await
+        // This server handles exactly one request per connection. Waiting for
+        // the peer's FIN keeps our only socket slot out of LISTEN and drops
+        // subsequent SYNs over a high-latency DERP path. `ContentBody` has
+        // already flushed and received ACKs for the complete declared body, so
+        // send an immediate RST and recycle the listener. TCP flush only waits
+        // for the RST to leave the local IP stack, not for a peer round trip.
+        picoserve::io::Socket::abort(self.0, timeouts, timer).await
     }
 }
 
@@ -890,14 +929,16 @@ mod tests {
 
     #[cfg(feature = "host-tests")]
     async fn health_client(stack: Stack<'_>, server: Ipv4Addr) {
-        request_and_expect(
-            stack,
-            server,
-            b"GET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
-            "application/json",
-            "{\"ok\":true}",
-        )
-        .await;
+        for _ in 0..2 {
+            request_and_expect(
+                stack,
+                server,
+                b"GET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+                "application/json",
+                "{\"ok\":true}",
+            )
+            .await;
+        }
     }
 
     #[cfg(feature = "host-tests")]
@@ -924,11 +965,12 @@ mod tests {
         let mut response = [0u8; 512];
         let mut length = 0;
         while length < response.len() {
-            let read = socket.read(&mut response[length..]).await.unwrap();
-            if read == 0 {
-                break;
+            match socket.read(&mut response[length..]).await {
+                Ok(0) => break,
+                Ok(read) => length += read,
+                Err(_) if response[..length].ends_with(body.as_bytes()) => break,
+                Err(error) => panic!("response read failed: {error:?}"),
             }
-            length += read;
         }
         let response = core::str::from_utf8(&response[..length]).unwrap();
         assert!(

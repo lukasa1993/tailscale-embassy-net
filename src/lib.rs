@@ -73,6 +73,20 @@ impl<'a> EmbassyTcp<'a> {
     pub fn socket_mut(&mut self) -> &mut TcpSocket<'a> {
         &mut self.socket
     }
+
+    /// Configure TCP keepalive and the maximum idle time in whole seconds.
+    ///
+    /// Taking scalar seconds keeps this adapter usable by applications that
+    /// also depend on a different `embassy-time` release through their MCU
+    /// HAL.
+    pub fn configure_liveness(&mut self, keep_alive_seconds: u64, idle_timeout_seconds: u64) {
+        self.socket
+            .set_keep_alive(Some(embassy_time::Duration::from_secs(keep_alive_seconds)));
+        self.socket
+            .set_timeout(Some(embassy_time::Duration::from_secs(
+                idle_timeout_seconds,
+            )));
+    }
 }
 
 impl ErrorType for EmbassyTcp<'_> {
