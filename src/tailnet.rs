@@ -475,7 +475,11 @@ pub async fn run_direct_udp<
                 let Some(packet) = PeerDatagram::new(peer, &receive_buffer[..length]) else {
                     continue;
                 };
-                to_tunnel.send(packet).await;
+                // This task also consumes replies from the tunnel. Waiting on
+                // a full inbound channel can deadlock with the tunnel waiting
+                // on a full outbound channel. WireGuard retransmits dropped
+                // datagrams, so bounded backpressure is deliberately lossy.
+                let _ = to_tunnel.try_send(packet);
             }
             Either::Second(outbound) => {
                 socket
@@ -556,7 +560,10 @@ pub async fn run_derp_connection<
                 }
                 let packet = PeerDatagram::new(source, &receive_buffer[..len])
                     .ok_or(DerpTaskError::Derp(DerpError::Length))?;
-                to_tunnel.send(packet).await;
+                // Keep the DERP reader live even when the tunnel is briefly
+                // saturated. Stalling here eventually fills the relay TCP
+                // receive window and makes the server remove this client.
+                let _ = to_tunnel.try_send(packet);
                 // The tunnel task may emit a WireGuard handshake reply or
                 // inject TCP whose stack response arrives a few polls later.
                 if let Ok(outbound) =
@@ -599,7 +606,7 @@ pub async fn run_tunnel_timer<M: RawMutex, const QUEUE: usize>(
 /// Invalid, spoofed, unauthorized, unknown-peer, and malformed packets are
 /// deliberately dropped. The dedicated control task supplies a fresh router
 /// after a full netmap update or reconnect.
-async fn dispatch_underlay<
+fn dispatch_underlay<
     M: RawMutex,
     StateMutex: RawMutex,
     const PEERS: usize,
@@ -613,16 +620,17 @@ async fn dispatch_underlay<
 ) {
     let endpoint = state.lock(|state| state.borrow().derp_peers.direct_endpoint_for(packet.peer()));
     let Some(endpoint) = endpoint else {
-        to_derp.send(packet).await;
+        let _ = to_derp.try_send(packet);
         return;
     };
     let Some(direct) = DirectDatagram::new(packet.peer(), endpoint, packet.datagram()) else {
-        to_derp.send(packet).await;
+        let _ = to_derp.try_send(packet);
         return;
     };
-    // The authenticated direct path is latency-critical. Mirror opportunistically
-    // to DERP so relay fallback remains available without ever blocking UDP.
-    to_direct.send(direct).await;
+    // Both underlays are datagram transports with their own retry machinery.
+    // Never let a full capacity-one queue stop the tunnel from consuming the
+    // opposite direction and create a two-task backpressure cycle.
+    let _ = to_direct.try_send(direct);
     let _ = to_derp.try_send(packet);
 }
 
@@ -671,7 +679,7 @@ pub async fn run_tailnet_tunnel<
                         if let Some(packet) =
                             PeerDatagram::new(outbound.destination, outbound.datagram)
                         {
-                            dispatch_underlay(state, packet, &to_derp, &to_direct).await;
+                            dispatch_underlay(state, packet, &to_derp, &to_direct);
                         }
                     }
                     Err(_error) => {
@@ -730,7 +738,7 @@ pub async fn run_tailnet_tunnel<
                         }
                     }
                     TunnelAction::Send(packet) => {
-                        dispatch_underlay(state, packet, &to_derp, &to_direct).await
+                        dispatch_underlay(state, packet, &to_derp, &to_direct)
                     }
                     TunnelAction::None => {}
                 }
@@ -745,7 +753,7 @@ pub async fn run_tailnet_tunnel<
                         if let Some(packet) =
                             PeerDatagram::new(outbound.destination, outbound.datagram)
                         {
-                            dispatch_underlay(state, packet, &to_derp, &to_direct).await;
+                            dispatch_underlay(state, packet, &to_derp, &to_direct);
                         }
                     }
                     Ok(None) => {}
@@ -998,6 +1006,8 @@ mod tests {
     use embassy_net::StackResources;
     #[cfg(feature = "host-tests")]
     use embassy_net::{IpEndpoint, StackResources, tcp::TcpSocket};
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    use embassy_sync::channel::Channel;
 
     use super::*;
 
@@ -1085,6 +1095,60 @@ mod tests {
         assert_eq!(exact.peer(), peer);
         assert_eq!(exact.datagram(), &[1, 2, 3, 4]);
         assert!(PeerDatagram::<4>::new(peer, &[1, 2, 3, 4, 5]).is_none());
+    }
+
+    #[test]
+    fn full_underlay_queues_drop_without_hiding_the_other_vector() {
+        const NODE: &str =
+            "nodekey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const DISCO: &str =
+            "discokey:404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f";
+        let map = tailscale_embassy_core::control::parse_map_response(
+            br#"{"Node":{"Addresses":["100.64.1.2/32"],"HomeDERP":1},"Peers":[{"ID":1,"Key":"nodekey:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","DiscoKey":"discokey:404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f","Addresses":["100.100.2.3/32"]}],"DERPMap":{"Regions":{"1":{"RegionID":1,"Nodes":[{"HostName":"derp1.example"}]}}}}"#,
+        )
+        .unwrap();
+        let peer = NodePublicKey::parse(NODE).unwrap();
+        let endpoint = Endpoint::new(Ipv4Addr::new(192, 168, 1, 9), 41641);
+        let mut control =
+            TailnetControlState::<1>::from_control_map(&NodePrivateKey::from_bytes([7; 32]), &map)
+                .unwrap();
+        assert_eq!(
+            control.derp_peers.authenticate_direct_ping(
+                DiscoPublicKey::parse(DISCO).unwrap(),
+                Some(peer),
+                endpoint,
+            ),
+            Some(peer)
+        );
+        let state = Mutex::<NoopRawMutex, _>::new(RefCell::new(control));
+        let to_derp = Channel::<NoopRawMutex, PeerDatagram<4>, 1>::new();
+        let to_direct = Channel::<NoopRawMutex, DirectDatagram<4>, 1>::new();
+        let occupied_direct = DirectDatagram::new(peer, endpoint, b"old!").unwrap();
+        to_direct.try_send(occupied_direct.clone()).unwrap();
+
+        let packet = PeerDatagram::new(peer, b"new!").unwrap();
+        dispatch_underlay(
+            &state,
+            packet.clone(),
+            &to_derp.sender(),
+            &to_direct.sender(),
+        );
+
+        assert_eq!(to_direct.try_receive(), Ok(occupied_direct));
+        assert_eq!(to_derp.try_receive(), Ok(packet));
+
+        let occupied_direct = DirectDatagram::new(peer, endpoint, b"keep").unwrap();
+        let occupied_derp = PeerDatagram::new(peer, b"stay").unwrap();
+        to_direct.try_send(occupied_direct.clone()).unwrap();
+        to_derp.try_send(occupied_derp.clone()).unwrap();
+        dispatch_underlay(
+            &state,
+            PeerDatagram::new(peer, b"drop").unwrap(),
+            &to_derp.sender(),
+            &to_direct.sender(),
+        );
+        assert_eq!(to_direct.try_receive(), Ok(occupied_direct));
+        assert_eq!(to_derp.try_receive(), Ok(occupied_derp));
     }
 
     #[test]
