@@ -1,0 +1,7 @@
+[constraints]
+max_cycles = 0
+max_cc = 20
+max_file_lines = 1493
+max_fn_lines = 116
+no_god_files = true
+max_upward_violations = 0

@@ -49,6 +49,12 @@ pub const DEFAULT_DERP_REPLY_DRAIN: Duration = Duration::from_millis(25);
 /// Strict alternation prevents a TCP retransmit producer from filling the
 /// relay/TLS buffers with duplicate segments before the peer ACK is serviced.
 pub const MAX_DERP_SEND_BURST: usize = 1;
+/// Normal packet processing does not claim WireGuard denial-of-service load.
+/// A future load sensor must set this deliberately rather than treating every
+/// inbound handshake as cookie-challenge traffic.
+const fn tunnel_under_load() -> bool {
+    false
+}
 
 /// Caller-owned fixed packet storage used by the IP-native channel driver.
 pub type TailnetDriverState<const MTU: usize, const RX: usize, const TX: usize> =
@@ -634,6 +640,54 @@ fn dispatch_underlay<
     let _ = to_derp.try_send(packet);
 }
 
+fn process_incoming<
+    StateMutex: RawMutex,
+    C: Clock,
+    Random: Rng,
+    const PEERS: usize,
+    const DATAGRAM: usize,
+>(
+    state: &SharedTailnetState<StateMutex, PEERS>,
+    clock: &C,
+    rng: &mut Random,
+    incoming: PeerDatagram<DATAGRAM>,
+    wireguard: &mut [u8],
+) -> TunnelAction<DATAGRAM> {
+    state.lock(|state| {
+        let mut state = state.borrow_mut();
+        match state.router.receive_derp(
+            clock,
+            rng,
+            incoming.peer(),
+            tunnel_under_load(),
+            incoming.datagram(),
+            wireguard,
+        ) {
+            Ok(RouterInbound::Ipv4(packet)) => TunnelAction::InjectIpv4(packet.bytes.len()),
+            Ok(RouterInbound::Reply(outbound)) => {
+                PeerDatagram::new(outbound.destination, outbound.datagram)
+                    .map_or(TunnelAction::None, TunnelAction::Send)
+            }
+            Ok(RouterInbound::HandshakeComplete(peer)) => state
+                .router
+                .flush_pending(clock, rng, peer, wireguard)
+                .ok()
+                .flatten()
+                .and_then(|outbound| PeerDatagram::new(outbound.destination, outbound.datagram))
+                .map_or(TunnelAction::None, TunnelAction::Send),
+            Ok(RouterInbound::Idle) => TunnelAction::None,
+            Err(_error) => {
+                #[cfg(feature = "defmt")]
+                defmt::warn!(
+                    "tailnet inbound underlay datagram dropped: {:?}",
+                    defmt::Debug2Format(&_error)
+                );
+                TunnelAction::None
+            }
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tailnet_tunnel<
     M: RawMutex,
@@ -693,43 +747,7 @@ pub async fn run_tailnet_tunnel<
             }
             Either4::First(Err(_)) => {}
             Either4::Second(incoming) | Either4::Third(incoming) => {
-                let action = state.lock(|state| {
-                    let mut state = state.borrow_mut();
-                    match state.router.receive_derp(
-                        clock,
-                        rng,
-                        incoming.peer(),
-                        bool::default(),
-                        incoming.datagram(),
-                        wireguard,
-                    ) {
-                        Ok(RouterInbound::Ipv4(packet)) => {
-                            TunnelAction::InjectIpv4(packet.bytes.len())
-                        }
-                        Ok(RouterInbound::Reply(outbound)) => {
-                            PeerDatagram::new(outbound.destination, outbound.datagram)
-                                .map_or(TunnelAction::None, TunnelAction::Send)
-                        }
-                        Ok(RouterInbound::HandshakeComplete(peer)) => state
-                            .router
-                            .flush_pending(clock, rng, peer, wireguard)
-                            .ok()
-                            .flatten()
-                            .and_then(|outbound| {
-                                PeerDatagram::new(outbound.destination, outbound.datagram)
-                            })
-                            .map_or(TunnelAction::None, TunnelAction::Send),
-                        Ok(RouterInbound::Idle) => TunnelAction::None,
-                        Err(_error) => {
-                            #[cfg(feature = "defmt")]
-                            defmt::warn!(
-                                "tailnet inbound underlay datagram dropped: {:?}",
-                                defmt::Debug2Format(&_error)
-                            );
-                            TunnelAction::None
-                        }
-                    }
-                });
+                let action = process_incoming(state, clock, rng, incoming, wireguard);
                 match action {
                     TunnelAction::InjectIpv4(length) => {
                         if packet_io.inject_ipv4(&wireguard[..length]).await.is_err() {
@@ -1016,6 +1034,7 @@ mod tests {
 
     #[test]
     fn default_static_ram_budget_is_bounded() {
+        assert!(!tunnel_under_load());
         let driver = size_of::<
             TailnetDriverState<
                 DEFAULT_TAILNET_MTU,
